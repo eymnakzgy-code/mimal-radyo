@@ -199,10 +199,20 @@
 <div id="toast">İşlem Başarılı!</div>
 <audio id="audio-player"></audio>
 
-<script>
+<script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, collection, addDoc, onSnapshot, doc, deleteDoc, query } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+    // --- CONFIG & INIT ---
+    const firebaseConfig = JSON.parse(__firebase_config);
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'afyon-lisesi-radyo';
+
     const expectedHash = "37947269e89269661cb0090e3f65df4fa1f2cb72ba2ba53cf65569b8a48f9909";
     
-    // Sabit Şarkılar (Sayfa her açıldığında varsayılan olarak gelecekler)
     const defaultTracks = [
         { name: "Gençliğe Hitabe", artist: "Canlı Yayın", url: "https://www.kultur.gov.tr/Genel/medya/muzik/ataturk/Genclige_Hitabe.mp3", isDefault: true },
         { name: "İstiklal marşı (şiir)", artist: "Sistem", url: "https://www.ktb.gov.tr/Eklenti/2164,istiklalsiirmp3.mp3?0", isDefault: true },
@@ -218,13 +228,61 @@
     const mainContainer = document.getElementById('main-container');
     const adminActionBtn = document.getElementById('admin-action-btn');
 
-    // Yerel hafızadan şarkıları çekiyoruz (Tarayıcıyı kapatsanız bile silinmezler)
-    let userTracks = JSON.parse(localStorage.getItem('my_custom_tracks')) || [];
-    let fullPlaylist = [...defaultTracks, ...userTracks];
+    let userTracks = [];
+    let fullPlaylist = [...defaultTracks];
     let currentIndex = -1;
     let isAdmin = false;
+    let currentUser = null;
 
-    // --- GÜVENLİK ---
+    // --- AUTHENTICATION ---
+    const initAuth = async () => {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+            await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+            await signInAnonymously(auth);
+        }
+    };
+    initAuth();
+
+    onAuthStateChanged(auth, (user) => {
+        currentUser = user;
+        if (user) {
+            setupRealtimeSync();
+        }
+    });
+
+    // --- GLOBAL FUNCTIONS (Exposed to window for HTML onclicks) ---
+    window.openAuthModal = () => {
+        if (isAdmin) { logoutAdmin(); return; }
+        authModal.style.display = 'flex';
+        passInput.focus();
+    };
+
+    window.closeAuthModal = () => { authModal.style.display = 'none'; passInput.value = ''; };
+
+    const logoutAdmin = () => {
+        isAdmin = false;
+        mainContainer.classList.remove('admin-mode');
+        adminActionBtn.innerHTML = '<i class="fa-solid fa-lock"></i> Yönetici';
+        showToast("Yönetici çıkışı yapıldı.");
+        renderPlaylist();
+    };
+
+    window.verifyPassword = async () => {
+        const hashed = await hashPassword(passInput.value);
+        if (hashed === expectedHash) {
+            isAdmin = true;
+            window.closeAuthModal();
+            mainContainer.classList.add('admin-mode');
+            adminActionBtn.innerHTML = '<i class="fa-solid fa-unlock"></i> Çıkış';
+            showToast("Yönetici modu aktif! Buluta müzik ekleyebilirsiniz.");
+            renderPlaylist();
+            fileInput.click(); 
+        } else {
+            showToast("Hatalı Şifre!");
+        }
+    };
+
     async function hashPassword(string) {
         const utf8 = new TextEncoder().encode(string);
         const hashBuffer = await crypto.subtle.digest('SHA-256', utf8);
@@ -232,86 +290,63 @@
         return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
-    function openAuthModal() {
-        if (isAdmin) {
-            logoutAdmin();
-            return;
-        }
-        authModal.style.display = 'flex';
-        passInput.focus();
-    }
-
-    function closeAuthModal() { authModal.style.display = 'none'; passInput.value = ''; }
-
-    function logoutAdmin() {
-        isAdmin = false;
-        mainContainer.classList.remove('admin-mode');
-        adminActionBtn.innerHTML = '<i class="fa-solid fa-lock"></i> Yönetici';
-        showToast("Yönetici çıkışı yapıldı.");
-        renderPlaylist();
-    }
-
-    async function verifyPassword() {
-        const hashed = await hashPassword(passInput.value);
-        if (hashed === expectedHash) {
-            isAdmin = true;
-            closeAuthModal();
-            mainContainer.classList.add('admin-mode');
-            adminActionBtn.innerHTML = '<i class="fa-solid fa-unlock"></i> Çıkış';
-            showToast("Yönetici modu aktif! Müzik ekleyebilirsiniz.");
+    // --- FIRESTORE SYNC ---
+    function setupRealtimeSync() {
+        const q = collection(db, 'artifacts', appId, 'public', 'data', 'tracks');
+        onSnapshot(q, (snapshot) => {
+            userTracks = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data(),
+                isDefault: false
+            }));
+            fullPlaylist = [...defaultTracks, ...userTracks];
             renderPlaylist();
-            fileInput.click(); 
-        } else {
-            showToast("Hatalı Şifre!");
-        }
+            
+            // Eğer müzik çalmıyorsa ve liste güncellendiyse başlığı güncelle
+            if (currentIndex === -1 && fullPlaylist.length > 0) {
+                document.getElementById('title').innerText = fullPlaylist[0].name;
+                document.getElementById('artist').innerText = fullPlaylist[0].artist;
+            }
+        }, (err) => console.error("Sync Error:", err));
     }
 
-    // --- MÜZİK YÖNETİMİ ---
-    fileInput.onchange = (e) => {
+    // --- MUSIC LOGIC ---
+    fileInput.onchange = async (e) => {
+        if (!currentUser || !isAdmin) return;
+        
         const files = Array.from(e.target.files);
-        let processedCount = 0;
+        showToast(`${files.length} dosya yükleniyor...`);
 
-        files.forEach(file => {
+        for (const file of files) {
             const reader = new FileReader();
-            reader.onload = (event) => {
+            reader.onload = async (event) => {
                 const base64Data = event.target.result;
-                const newTrack = {
-                    name: file.name.replace(/\.[^/.]+$/, ""),
-                    artist: "Kalıcı Parça",
-                    url: base64Data, // Dosyayı veri olarak (Base64) kaydediyoruz
-                    isDefault: false,
-                    id: Date.now() + Math.random()
-                };
-                userTracks.push(newTrack);
-                processedCount++;
-                
-                // Tüm dosyalar bittiğinde kaydet
-                if (processedCount === files.length) {
-                    saveToLocalStorage();
+                try {
+                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'tracks'), {
+                        name: file.name.replace(/\.[^/.]+$/, ""),
+                        artist: "Okul Radyosu",
+                        url: base64Data,
+                        createdAt: Date.now()
+                    });
+                } catch (err) {
+                    showToast("Yükleme hatası: Boyut sınırı aşılmış olabilir.");
+                    console.error(err);
                 }
             };
             reader.readAsDataURL(file);
-        });
+        }
     };
 
-    function deleteTrack(id, event) {
+    window.deleteTrack = async (id, event) => {
         event.stopPropagation();
-        // Sadece yönetici tarafından eklenenleri silmeye izin veriyoruz
-        userTracks = userTracks.filter(t => t.id !== id);
-        saveToLocalStorage();
-        showToast("Şarkı kalıcı olarak silindi.");
-    }
-
-    function saveToLocalStorage() {
+        if (!isAdmin) return;
         try {
-            localStorage.setItem('my_custom_tracks', JSON.stringify(userTracks));
-            fullPlaylist = [...defaultTracks, ...userTracks];
-            renderPlaylist();
-        } catch (e) {
-            showToast("Hata: Tarayıcı hafızası dolmuş olabilir!");
-            console.error(e);
+            await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tracks', id));
+            showToast("Şarkı buluttan silindi.");
+        } catch (err) {
+            showToast("Silme hatası!");
         }
-    }
+    };
 
     function renderPlaylist() {
         playlistEl.innerHTML = '';
@@ -320,11 +355,11 @@
             div.className = `track-item ${index === currentIndex ? 'active' : ''}`;
             
             let deleteIcon = (!track.isDefault && isAdmin) 
-                ? `<i class="fa-solid fa-trash-can delete-btn" onclick="deleteTrack(${track.id}, event)"></i>` 
+                ? `<i class="fa-solid fa-trash-can delete-btn" onclick="deleteTrack('${track.id}', event)"></i>` 
                 : '';
 
             div.innerHTML = `
-                <div class="track-name" onclick="loadTrack(${index})">
+                <div class="track-name" onclick="window.loadTrack(${index})">
                     <i class="fa-solid ${index === currentIndex ? 'fa-play' : 'fa-music'}" style="margin-right:8px"></i>
                     ${track.name}
                 </div>
@@ -334,7 +369,7 @@
         });
     }
 
-    function loadTrack(index) {
+    window.loadTrack = (index) => {
         if (index < 0 || index >= fullPlaylist.length) return;
         currentIndex = index;
         const track = fullPlaylist[index];
@@ -343,15 +378,13 @@
         document.getElementById('artist').innerText = track.artist;
         renderPlaylist();
         playTrack();
-    }
+    };
 
     function playTrack() {
         audio.play().then(() => {
             playBtn.innerHTML = '<i class="fa-solid fa-pause"></i>';
             document.getElementById('disc').classList.add('playing');
-        }).catch(err => {
-            console.warn("Otomatik oynatma engellendi, kullanıcının tıklaması gerekiyor.");
-        });
+        }).catch(err => console.warn("Interaksiyon gerekli."));
     }
 
     playBtn.onclick = () => {
@@ -363,8 +396,8 @@
         }
     };
 
-    document.getElementById('next').onclick = () => loadTrack((currentIndex + 1) % fullPlaylist.length);
-    document.getElementById('prev').onclick = () => loadTrack((currentIndex - 1 + fullPlaylist.length) % fullPlaylist.length);
+    document.getElementById('next').onclick = () => window.loadTrack((currentIndex + 1) % fullPlaylist.length);
+    document.getElementById('prev').onclick = () => window.loadTrack((currentIndex - 1 + fullPlaylist.length) % fullPlaylist.length);
     
     audio.ontimeupdate = () => {
         const percent = (audio.currentTime / audio.duration) * 100;
@@ -373,10 +406,7 @@
         if(audio.duration) document.getElementById('duration').innerText = formatTime(audio.duration);
     };
 
-    audio.onended = () => {
-        // Şarkı bittiğinde sonrakine geç
-        loadTrack((currentIndex + 1) % fullPlaylist.length);
-    };
+    audio.onended = () => window.loadTrack((currentIndex + 1) % fullPlaylist.length);
 
     function formatTime(t) {
         if (isNaN(t)) return "0:00";
@@ -392,16 +422,6 @@
         t.style.display = 'block';
         setTimeout(() => t.style.display = 'none', 3000);
     }
-
-    // İlk yükleme: Verileri getir ve arayüzü hazırla
-    window.onload = () => {
-        renderPlaylist();
-        if (fullPlaylist.length > 0) {
-            const firstTrack = fullPlaylist[0];
-            document.getElementById('title').innerText = firstTrack.name;
-            document.getElementById('artist').innerText = firstTrack.artist;
-        }
-    };
 </script>
 </body>
 </html>
